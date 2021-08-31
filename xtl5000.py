@@ -5,9 +5,13 @@
 # Modified for use with XTL series SB9600/SBEP commands by W3AXL
 #
 
+import logging
+
 from time import sleep
 from binascii import hexlify, unhexlify, b2a_uu
 import sb9600
+
+logger = logging.getLogger(__name__)
 
 # Addressable modules
 MODULE_BCAST = 0
@@ -70,11 +74,13 @@ class XTL:
     # O5 display icon definitions
     display_icons_o5 = {
         'monitor': 0x01,
+        'secure': 0x02,
         'scan': 0x04,
         'direct': 0x07,
         'led_amber': 0x0f,
         'led_red': 0x10,
-        'low_power': 0x56
+        'aes' : 0x55,
+        'low_power': 0x56,
     }
 
     # O5 display subdevices
@@ -89,7 +95,7 @@ class XTL:
         self.head = head
         self.inSBEP = False
 
-    def processMsg(self,msg):
+    def processMsg(self,msg, vh):
         """Process SB9600/SBEP message and decode to human-readable text
 
         Args:
@@ -97,7 +103,7 @@ class XTL:
         """
 
         # Decode by device address
-
+        logger.debug("RAW RECVD<: {}".format(hexlify(msg, ' ')))
         # Handle SBEP first
         if self.inSBEP:
             # reset
@@ -106,7 +112,7 @@ class XTL:
             address = msg[0]
             subaddr = msg[1]
             length = msg[2]
-            opcode = msg[4]          
+            opcode = msg[4]         
             # Get data based on length
             data = msg[8:length+2]
 
@@ -118,7 +124,15 @@ class XTL:
                 subdev = msg[6]
                 subdevName = self.getDisplaySubDev(subdev)
                 # print data payload
-                self.printMsg("SBEP Disp", "Set {} to '{}'".format(subdevName,data.decode('ascii')))
+                subdevData = data.decode('ascii').rstrip('\x00')
+                logger.info(f'RECVD<: Set {subdevName} to {subdevData}')
+                vh.add_note("RECVD<: Set {} to {}".format(subdevName,subdevData))
+                if subdevName == 'text_zone':
+                    vh.set_text_zone(subdevData)
+                elif subdevName == 'text_channel':
+                    vh.set_text_channel(subdevData)
+                elif subdevName == 'text_softkeys':
+                    vh.set_softkeys(subdevData)
                 # return
                 return
 
@@ -127,26 +141,42 @@ class XTL:
                 # get icon
                 icon = self.getDisplayIcon(msg[3])
                 # get state
-                if opcode == 0x01:
-                    state = "on"
-                else:
+                if opcode == 0x00:
                     state = "off"
-                # print
-                self.printMsg("SBEP Icon","{} ({}) icon {}".format(icon, hex(msg[3]), state))
+                elif opcode == 0x01:
+                    state = "on"
+                elif opcode == 0x02:
+                    state = "on"
+                elif opcode == 0xFE:
+                    state = "blink"
+                else:
+                    state = str(opcode)
+                vh.add_note("RECVD<: {} icon {}".format(icon, state))
+                vh.set_icon(icon, state)
+                logger.info(f'ICON {icon} {msg[3]} STATE {state} {opcode}')
                 return
 
             # Fallback to printing raw message
             else:
-                print("RECVD<: SBEP decoded")
-                print("        Raw Msg: {}".format(hexlify(msg, ' ')))
-                print("        Address: {}, Subaddr: {}, Length: {}, Opcode: {}".format(hex(address), hex(subaddr), length, hex(opcode)))
+                logger.info("RECVD<: SBEP decoded")
+                logger.info("        Raw Msg: {}".format(hexlify(msg, ' ')))
+                logger.info("        Address: {}, Subaddr: {}, Length: {}, Opcode: {}".format(hex(address), hex(subaddr), length, hex(opcode)))
                 return
 
         # SB9600 parameters
         addr = msg[0]
-        param1 = msg[1]
-        param2 = msg[2]
-        function = msg[3]
+        try:
+            param1 = msg[1]
+        except IndexError:
+            param1 = ''  
+        try:  
+            param2 = msg[2]
+        except IndexError:
+            param2 = ''
+        try:
+            function = msg[3]
+        except IndexError:
+            function = ''
 
         # broadcast module
         if addr == 0x00:
@@ -160,30 +190,7 @@ class XTL:
                     speed = param1
                 # Get module name
                 module = self.getSbepModule(param2)
-                # print
-                #print("RECVD<: Entering SBEP mode to {} at {} baud".format(module, speed))
-                return
-            # Channel state command
-            elif function == 0x0A:
-                # Monitor mode
-                if param1 == 0x01:
-                    if param2 == 0x01:
-                        self.printMsg("Chan State","Monitor ON")
-                        return
-                    else:
-                        self.printMsg("Chan State","Monitor OFF")
-                        return
-                # TX mode
-                elif param1 == 0x03:
-                    if param2 == 0x01:
-                        self.printMsg("Chan State","Transmit ON")
-                        return
-                    else:
-                        self.printMsg("Chan State","Transmit OFF")
-                        return
-            # Fallback for unknown message
-            else:
-                self.printMsg("Unknown","Unknown broadcast message function {}: params {}, {}".format(hex(function),hex(param1),hex(param2)))
+                # print("RECVD<: Entering SBEP mode to {} at {} baud".format(module, speed))
                 return
 
         # front panel module
@@ -192,24 +199,26 @@ class XTL:
             if function == 0x57:
                 # lookup button
                 btn = self.getButton(param1)
-                if "knob" in btn:
-                    self.printMsg("Btn/Knob","{} clicks: {}".format(btn,param2))
+                if btn is not None and "knob" in btn:
+                    if 'knob_vol' == btn:
+                        vh.set_volume(param2)
+                    logger.info("RECVD<: {} clicks: {}".format(btn,param2))
                     return
                 else:
                     if param2 == 0x01:
-                        self.printMsg("Btn/Knob","{} pressed".format(btn))
+                        logger.info("RECVD<: {} pressed".format(btn))
                         return
                     else:
-                        self.printMsg("Btn/Knob","{} released".format(btn))
+                        logger.info("RECVD<: {} release".format(btn))
                         return
             # backlighting / illumination
             elif function == 0x58:
                 # display BL
                 if param1 == 0x02:
-                    self.printMsg("Lighting","Display BL set to {}".format(param2))
+                    logger.info("RECVD<: Display BL set to {}".format(param2))
                     return
                 elif param1 == 0x03:
-                    self.printMsg("Lighting","Button BL set to {}".format(param2))
+                    logger.info("RECVD<: Button BL set to {}".format(param2))
                     return
 
         # radio module
@@ -217,39 +226,24 @@ class XTL:
             # audio device
             if function == 0x1D:
                 if param2 == 0x01:
-                    self.printMsg("Audio","Unmuted")
+                    vh.add_note("RECVD<: Audio unmuted")
+                    vh.set_unmute()
                     return
                 elif param2 == 0x00:
-                    self.printMsg("Audio","Muted")
-                    return
-            # channel state?
-            elif function == 0x1e:
-                # Channel idle
-                if param1 == 0x00 and param2 == 0x00:
-                    self.printMsg("Channel","Idle state")
-                    return
-                # Channel RX
-                if param2 == 0x03:
-                    self.printMsg("Channel","RX state")
-                    return
-                else:
-                    self.printMsg("Channel","Unknown state: {} {}".format(hex(param1),hex(param2)))
+                    vh.add_note("RECVD<: Audio muted")
+                    vh.set_mute()
                     return
             # channel change cmd device?
-            elif function == 0x1f:
-                self.printMsg("Chan Change","Goto CH {}".format(param2))
+            if function == 0x1f:
+                logger.info("RECVD<: Goto CH {}".format(param2))
                 return
             # channel change ack device?
-            elif function == 0x60:
-                self.printMsg("Chan Change","Goto CH {} OK".format(param2))
-                return
-            # fallback
-            else:
-                self.printMsg("Unknown","Unknown message for radio module (0x01): func {}, params {} {}".format(hex(function),hex(param1),hex(param2)))
+            if function == 0x60:
+                logger.info("RECVD<: CH change {} ACK".format(param2))
                 return
 
         # default to just printing the message if we didn't do anything else
-        self.printMsg("Unknown","Raw SB9600: {}".format(hexlify(msg, ' ')))
+        logger.info("RECVD<: {}".format(hexlify(msg, ' ')))
 
     def getButton(self, code):
         """Lookup button by opcode
@@ -320,6 +314,7 @@ class XTL:
         if self.head == 'O5':
             for key, value in self.display_icons_o5.items():
                 if code == value:
+                    # print('DISP ICON', key)
                     return key
             return "{} (Unknown)".format(hex(code))
         else:
